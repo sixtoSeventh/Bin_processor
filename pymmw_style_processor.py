@@ -57,7 +57,7 @@ class PymmwStyleProcessor:
         return x + 1
     
     def process_frame(self, data_cube):
-        """处理一帧数据"""
+        """处理一帧数据 - 使用完整的 3D FFT (Range-Doppler-Azimuth)"""
         # TDM MIMO chirp 顺序 (根据 18xx.mmwave.json):
         # chirp 0: TX0 (0x1) - 方位
         # chirp 1: TX2 (0x4) - 方位  
@@ -65,10 +65,10 @@ class PymmwStyleProcessor:
         # 用于方位成像的是 TX0 和 TX2 (chirp 0 和 chirp 1)
         tx0_indices = np.arange(0, data_cube.shape[1], self.numTxAntennas)  # chirp 0, 3, 6, ...
         tx2_indices = np.arange(1, data_cube.shape[1], self.numTxAntennas)  # chirp 1, 4, 7, ... (TX2)
-        tx0_data = data_cube[:, tx0_indices, :]
-        tx2_data = data_cube[:, tx2_indices, :]
+        tx0_data = data_cube[:, tx0_indices, :]  # (4, 16, 256)
+        tx2_data = data_cube[:, tx2_indices, :]  # (4, 16, 256)
         
-        # Range-Doppler
+        # ========== Range-Doppler (保持不变) ==========
         range_doppler_sum = None
         for rx_idx in range(self.numRxAntennas):
             rx_data = tx0_data[rx_idx, :, :]
@@ -79,15 +79,34 @@ class PymmwStyleProcessor:
             else:
                 range_doppler_sum += np.abs(range_doppler) ** 2
         
-        # Azimuth-Range
-        tx0_range = np.fft.fft(tx0_data, n=self.numRangeBins, axis=2)
-        tx2_range = np.fft.fft(tx2_data, n=self.numRangeBins, axis=2)
-        tx0_static = np.mean(tx0_range, axis=1)
-        tx2_static = np.mean(tx2_range, axis=1)
-        virtual_array = np.concatenate([tx0_static, tx2_static], axis=0).T
-        range_azimuth = np.fft.fft(virtual_array, n=self.numAngleBins, axis=1)
-        range_azimuth = np.abs(range_azimuth)
-        range_azimuth = np.fft.fftshift(range_azimuth, axes=1).T
+        # ========== 3D FFT: Range-Doppler-Azimuth ==========
+        # 步骤1: Range FFT
+        tx0_range = np.fft.fft(tx0_data, n=self.numRangeBins, axis=2)  # (4, 16, 256)
+        tx2_range = np.fft.fft(tx2_data, n=self.numRangeBins, axis=2)  # (4, 16, 256)
+        
+        # 步骤2: Doppler FFT
+        tx0_doppler = np.fft.fft(tx0_range, axis=1)  # (4, 16, 256)
+        tx2_doppler = np.fft.fft(tx2_range, axis=1)  # (4, 16, 256)
+        tx0_doppler = np.fft.fftshift(tx0_doppler, axes=1)
+        tx2_doppler = np.fft.fftshift(tx2_doppler, axes=1)
+        
+        # 步骤3: 构建虚拟阵列并做 Angle FFT
+        # 拼接 TX0 和 TX2 的数据: (8, 16, 256)
+        virtual_3d = np.concatenate([tx0_doppler, tx2_doppler], axis=0)  # (8, 16, 256)
+        
+        # 对每个 (Doppler, Range) bin 做 Angle FFT
+        # 转置为 (16, 256, 8) 方便处理
+        virtual_3d = np.transpose(virtual_3d, (1, 2, 0))  # (16, 256, 8)
+        
+        # Angle FFT: 对最后一维 (8 个虚拟天线) 做 FFT
+        range_doppler_azimuth = np.fft.fft(virtual_3d, n=self.numAngleBins, axis=2)  # (16, 256, 64)
+        range_doppler_azimuth = np.abs(range_doppler_azimuth)
+        range_doppler_azimuth = np.fft.fftshift(range_doppler_azimuth, axes=2)  # 角度居中
+        
+        # 步骤4: 取所有 Doppler bin 的最大值投影 (Maximum Intensity Projection)
+        # 这样可以同时显示静态和移动目标
+        range_azimuth = np.max(range_doppler_azimuth, axis=0)  # (256, 64)
+        range_azimuth = range_azimuth.T  # (64, 256)
         
         return range_doppler_sum, range_azimuth
 
